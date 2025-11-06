@@ -161,6 +161,7 @@ class HistoricalDataManager:
             except Exception:
                 pass  # If cache read fails, fetch from API
         
+        # Try primary scores endpoint first
         url = f"{self.base_url}/historical/sports/{sport}/scores"
         params = {
             "apiKey": self.api_key,
@@ -170,27 +171,72 @@ class HistoricalDataManager:
         
         try:
             response = requests.get(url, params=params, timeout=30)
-            response.raise_for_status()
-            data = response.json()
             
-            # Cache the full response
-            with open(cache_file, 'w') as f:
-                json.dump(data, f)
-            
-            # Handle different response formats
-            if isinstance(data, list):
-                return data
-            elif isinstance(data, dict):
-                if 'data' in data:
-                    return data['data'] if isinstance(data['data'], list) else []
-                elif 'results' in data:
-                    return data['results'] if isinstance(data['results'], list) else []
-                elif 'events' in data:
-                    return data['events'] if isinstance(data['events'], list) else []
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Cache the full response
+                with open(cache_file, 'w') as f:
+                    json.dump(data, f)
+                
+                # Handle different response formats
+                if isinstance(data, list):
+                    return data
+                elif isinstance(data, dict):
+                    if 'data' in data:
+                        return data['data'] if isinstance(data['data'], list) else []
+                    elif 'results' in data:
+                        return data['results'] if isinstance(data['results'], list) else []
+                    elif 'events' in data:
+                        return data['events'] if isinstance(data['events'], list) else []
+                    else:
+                        return []
                 else:
-                    st.warning(f"Unexpected scores response format for {date}. Keys: {list(data.keys())}")
                     return []
+            
+            elif response.status_code == 404:
+                # Scores endpoint not found, try using the regular odds endpoint 
+                # which sometimes includes completed scores
+                st.info(f"Note: Using odds data for scores (404 on scores endpoint for {date})")
+                
+                # Try to get completed games from odds endpoint
+                odds_url = f"{self.base_url}/historical/sports/{sport}/odds"
+                odds_params = {
+                    "apiKey": self.api_key,
+                    "regions": "us",
+                    "markets": "h2h",
+                    "oddsFormat": "american",
+                    "date": date + "T00:00:00Z",
+                    "commenceTimeFrom": date + "T00:00:00Z",
+                    "commenceTimeTo": date + "T23:59:59Z"
+                }
+                
+                odds_response = requests.get(odds_url, params=odds_params, timeout=30)
+                if odds_response.status_code == 200:
+                    odds_data = odds_response.json()
+                    
+                    # Extract games and check if they have scores
+                    games = []
+                    if isinstance(odds_data, list):
+                        games = odds_data
+                    elif isinstance(odds_data, dict):
+                        games = odds_data.get('data', odds_data.get('results', []))
+                    
+                    # Filter for completed games (those with scores)
+                    completed_games = []
+                    for game in games:
+                        if isinstance(game, dict) and 'scores' in game:
+                            completed_games.append(game)
+                    
+                    if completed_games:
+                        # Cache this alternative data
+                        with open(cache_file, 'w') as f:
+                            json.dump(completed_games, f)
+                        return completed_games
+                
+                return []
             else:
+                st.warning(f"HTTP Error {response.status_code} fetching scores for {date}")
                 return []
                 
         except requests.exceptions.HTTPError as e:
@@ -896,8 +942,16 @@ if api_key and not st.session_state['historical_data_loaded']:
         min_value=7,
         max_value=180,
         value=30,
-        help="More days = better model, but slower training"
+        help="More days = better model, but slower training. Use recent completed games (7-60 days ago works best)"
     )
+    
+    st.sidebar.info("""
+    💡 **Tips for Historical Data:**
+    - Use **7-14 days** for testing
+    - Use **30-60 days** for production
+    - Scores only available for **completed games**
+    - Try recent dates if getting 404 errors
+    """)
     
     if st.sidebar.button("📊 Load & Train Model", type="primary"):
         with st.spinner("Loading historical data and training ML model..."):
